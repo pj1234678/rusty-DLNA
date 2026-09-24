@@ -1,0 +1,26 @@
+[package]
+name = "RustyDLNA7"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Slimmed from "full": only the features the binary + tests use
+# (fs/net/sync/time/task macros/process). Drops signal, test-util, tracing,
+# and other dead code for faster builds and a smaller binary. Runtime behavior
+# is identical: no trimmed feature is referenced anywhere.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt", "rt-multi-thread", "sync", "time"] }
+# NOTE: dashmap was removed — only stale src/*.bak* drafts referenced it;
+# live code uses std HashMap (read-only after precache, no locking needed).
+
+[profile.release]
+# Portable max-perf: generic CPU so the binary runs anywhere (no -C target-cpu
+# baked in). For a machine-specific build instead, leave this file untouched
+# and set:  $env:RUSTFLAGS="-C target-cpu=native"  (PowerShell)
+#           RUSTFLAGS="-C target-cpu=native" cargo build --release  (sh)
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+debug = false
