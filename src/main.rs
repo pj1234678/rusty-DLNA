@@ -247,15 +247,24 @@ async fn handle_client(mut stream: TcpStream, cache: Arc<HashMap<Box<[u8]>, Arc<
     let mut buffer = [0u8; 4096]; // Pure stack memory
     let mut pos = 0;
 
-    // Total header deadline (slowloris fix): the per-read 5s timeout below
-    // resets on EVERY received byte, so without this a 1B/4s drip holds one
-    // Semaphore permit + task forever (1000 drips = DoS), for GET, POST or
-    // even garbage, pre-routing. Headers must now complete within 5s of
-    // connect no matter the drip rate; legitimate LAN clients finish in
-    // milliseconds (split-packet and 1s-delayed completions still pass).
-    // POST bodies are never waited on (reply/close at headers end), so slow
-    // bodies hold nothing by design; the drip fix from [E] covers writes.
+    // Total header (+ Xbox-gated body) deadline (slowloris fix): the per-read
+    // 5s timeout below resets on EVERY received byte, so without this a 1B/4s
+    // drip holds one Semaphore permit + task forever (1000 drips = DoS), for
+    // GET, POST or even garbage, pre-routing. Headers must now complete
+    // within 5s of connect no matter the drip rate; legitimate LAN clients
+    // finish in milliseconds (split-packet and 1s-delayed completions still
+    // pass). Non-Xbox POST bodies are never waited on (reply/close at headers
+    // end), so slow bodies hold nothing by design; Xbox POST bodies ARE waited
+    // on up to Content-Length while the total fits the 4K stack buffer (split-
+    // packet Browse fix — without this an Xbox header/body split arrives with
+    // no SOAP body and gets silence). Oversized Xbox claims (need > 4K) dispatch
+    // from headers-end bytes without waiting (DoS guard preserved).
+    // The drip fix from [E] covers writes.
     let header_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Once Xbox headers are seen, the total header+body need is pinned here so
+    // later reads don't have to re-detect the terminator: the incremental
+    // window below only overlaps fresh bytes.
+    let mut body_need: Option<usize> = None;
     loop {
         let left = header_deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() { return; }
@@ -264,12 +273,45 @@ async fn handle_client(mut stream: TcpStream, cache: Arc<HashMap<Box<[u8]>, Arc<
             Ok(Ok(n)) => {
                 let prev = pos;
                 pos += n;
+                // Waiting on an Xbox POST body from an earlier read: headers
+                // are known, just check the byte count (no re-scan needed).
+                if let Some(need) = body_need {
+                    if pos >= need { break; }
+                    if pos == buffer.len() { return; }
+                    continue;
+                }
                 // Only windows overlapping freshly-read bytes can newly match:
                 // every window fully inside the old prefix already tested
                 // negative on a previous iteration, and the first iteration
                 // starts at 0 (identical outcome to a full rescan).
                 let from = prev.saturating_sub(3);
-                if headers_complete(&buffer[from..pos]) { break; }
+                if headers_complete(&buffer[from..pos]) {
+                    // GET (and non-POST): headers are the whole request.
+                    if !buffer[..pos].starts_with(b"POST ") { break; }
+                    // POST: only Xbox waits for the SOAP body. The firing
+                    // terminator starts at/after `from` (any older one would
+                    // have fired on its own read), so only the fresh window
+                    // needs scanning — not the whole buffer.
+                    let hend = match headers_end_rel(&buffer[from..pos]) {
+                        Some(rel) => from + rel,
+                        None => break,
+                    };
+                    // Non-Xbox keeps the old contract: dispatch at headers end,
+                    // never wait past headers (split-packet POST stays silent).
+                    if !is_xbox_headers(&buffer[..hend]) { break; }
+                    let need = hend.saturating_add(parse_content_length(&buffer[..hend]));
+                    if need > buffer.len() {
+                        // Oversized Content-Length claim (or headers alone
+                        // already filling 4K): dispatch whatever arrived,
+                        // never wait past headers (slowloris/OOM guard; legit
+                        // Xbox Browses are ~1.2K total and always fit).
+                        break;
+                    }
+                    if pos >= need { break; }
+                    // Body incomplete but fits: pin the target and keep
+                    // reading (pos < buffer.len() here, else pos >= need).
+                    body_need = Some(need);
+                }
                 if pos == buffer.len() { return; }
             }
             Ok(Err(_)) => return,
@@ -277,12 +319,208 @@ async fn handle_client(mut stream: TcpStream, cache: Arc<HashMap<Box<[u8]>, Arc<
     }
 
     let req = &buffer[..pos];
-    
+
     if req.starts_with(b"GET ") {
         handle_get_request(stream, req, config).await;
     } else if req.starts_with(b"POST ") {
         handle_post_request(stream, req, cache, config).await;
     }
+}
+
+// Offset just past the first "\r\n\r\n" in the window, if present.
+// Positioned twin of the tail-check + \r-hunt pair: same matches, but also
+// reports WHERE, so handle_client can pin the header end without rescanning
+// the whole buffer (it only ever scans the fresh-bytes window).
+// Xbox-gated path only; non-Xbox behavior unchanged.
+fn headers_end_rel(window: &[u8]) -> Option<usize> {
+    if window.len() >= 4
+        && window[window.len() - 4] == b'\r'
+        && window[window.len() - 3] == b'\n'
+        && window[window.len() - 2] == b'\r'
+        && window[window.len() - 1] == b'\n'
+    {
+        return Some(window.len());
+    }
+    let mut i = 0usize;
+    while i < window.len() {
+        while i < window.len() && window[i] != b'\r' {
+            i += 1;
+        }
+        if i + 4 <= window.len()
+            && window[i + 1] == b'\n'
+            && window[i + 2] == b'\r'
+            && window[i + 3] == b'\n'
+        {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Case-insensitive `Content-Length: <digits>` parse over header bytes.
+// Missing/invalid/overflow => 0 (no body wait). Xbox-gated path only.
+fn parse_content_length(headers: &[u8]) -> usize {
+    const CANON14: &[u8] = b"Content-Length";
+    const FOLDED14: &[u8] = b"content-length";
+    let mut i = 0usize;
+    while i + 14 <= headers.len() {
+        let b = headers[i];
+        if (b == b'C' || b == b'c')
+            && (headers[i..].starts_with(CANON14)
+                || headers[i..i + 14].eq_ignore_ascii_case(FOLDED14))
+        {
+            let mut j = i + 14;
+            while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') {
+                j += 1;
+            }
+            if j >= headers.len() || headers[j] != b':' {
+                i += 1;
+                continue;
+            }
+            j += 1;
+            while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') {
+                j += 1;
+            }
+            let mut v: usize = 0;
+            let mut digits = 0usize;
+            while j < headers.len() && headers[j].is_ascii_digit() {
+                digits += 1;
+                let d = (headers[j] - b'0') as usize;
+                match v.checked_mul(10).and_then(|x| x.checked_add(d)) {
+                    Some(nv) => v = nv,
+                    None => return 0,
+                }
+                j += 1;
+            }
+            if digits == 0 {
+                i += 1;
+                continue;
+            }
+            return v;
+        }
+        i += 1;
+    }
+    0
+}
+
+// Xbox detection: header-scoped only (never the SOAP body/ObjectID).
+// True iff a `User-Agent:` header line value matches the Xbox/Windows DLNA
+// stack, case-insensitively. The Xbox Media Player app does NOT send "xbox":
+// it sends the Windows DLNA stack UA, e.g.
+// `Microsoft-Windows/10.0 UPnP/1.0 Microsoft-DLNA DLNADOC/1.50`
+// (observed live; WMP on PC sends the same and also pages correctly).
+// Matches: `xbox` (Xbox/2.0, Xbox-One/2.0, XBOX, ...), `microsoft-dlna`,
+// `microsoft-windows`. All other clients (VLC, Samsung TV, curl,
+// PlayStation, missing/empty UA) => false => legacy VLC behavior
+// (ignore paging, header-only POST dispatch).
+fn is_xbox_headers(headers: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 10 <= headers.len() {
+        let b = headers[i];
+        if b == b'U' || b == b'u' {
+            // Cheap 10-byte `user-agent` name check (colon handled below to
+            // tolerate `User-Agent :` spacing like parse_content_length).
+            if headers[i..i + 10].eq_ignore_ascii_case(b"user-agent") {
+                let mut j = i + 10;
+                while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') {
+                    j += 1;
+                }
+                if j < headers.len() && headers[j] == b':' {
+                    j += 1;
+                    while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') {
+                        j += 1;
+                    }
+                    // Line value runs to CR or LF (or end of headers).
+                    let mut k = j;
+                    while k < headers.len() && headers[k] != b'\r' && headers[k] != b'\n' {
+                        k += 1;
+                    }
+                    let v = &headers[j..k];
+                    if contains_xbox_ci(v)
+                        || contains_ci(v, b"microsoft-dlna")
+                        || contains_ci(v, b"microsoft-windows")
+                    {
+                        return true;
+                    }
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// Generic case-insensitive ASCII substring search (non-ASCII bytes never
+// match). Headers are ASCII in practice; body filenames are never scanned
+// because callers pass headers-only slices.
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + needle.len() <= hay.len() {
+        if hay[i] == needle[0] || hay[i].to_ascii_lowercase() == needle[0] {
+            if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// Case-insensitive `xbox` substring search (ASCII-only fold; non-ASCII bytes
+// never match). Headers are ASCII in practice; body filenames are never
+// scanned because callers pass headers-only slices.
+fn contains_xbox_ci(hay: &[u8]) -> bool {
+    if hay.len() < 4 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + 4 <= hay.len() {
+        let b = hay[i];
+        if b == b'X' || b == b'x' {
+            if (hay[i + 1] == b'B' || hay[i + 1] == b'b')
+                && (hay[i + 2] == b'O' || hay[i + 2] == b'o')
+                && (hay[i + 3] == b'X' || hay[i + 3] == b'x')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// End offset (past `\r\n\r\n`) of the header block inside a full request, or
+// `req.len()` when no terminator is present (should not happen on this path:
+// handle_client only dispatches after headers_complete fired).
+fn headers_end(req: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i + 4 <= req.len() {
+        if req[i] == b'\r'
+            && req[i + 1] == b'\n'
+            && req[i + 2] == b'\r'
+            && req[i + 3] == b'\n'
+        {
+            return i + 4;
+        }
+        // Skip fast over non-CR bytes (same matches as rhunt_complete).
+        if req[i] == b'\r' {
+            i += 1;
+        } else {
+            // Jump to next CR candidate.
+            let mut j = i + 1;
+            while j < req.len() && req[j] != b'\r' {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    req.len()
 }
 
 // Zero-allocation static routing & ultra-low allocation file streaming
@@ -421,6 +659,215 @@ fn extract_object_id(req: &[u8]) -> &[u8] {
     object_id
 }
 
+// Xbox-gated paging extraction: StartingIndex + RequestedCount in one scan.
+// Only called when is_xbox_headers() is true; all other clients keep the VLC
+// contract (ignore paging, serve full). Semantics mirror the Xbox build:
+// first occurrence of each tag wins; value = bytes between the first '>' after
+// the tag and the next '<' (handles Xbox attrs `<StartingIndex ...>12</...>`);
+// empty/>10-digit/non-digit/u32-overflow/missing => 0. RequestedCount 0 means
+// "all remaining".
+fn extract_browse_paging(req: &[u8]) -> (usize, u32) {
+    const ST: &[u8] = b"StartingIndex";
+    const RC: &[u8] = b"RequestedCount";
+    let mut start = 0u32;
+    let mut count = 0u32;
+    let mut seen = 0u8;
+    let n = req.len();
+    let mut i = 0usize;
+    while i < n {
+        let b = req[i];
+        if b == b'S' && seen & 1 == 0 && req[i..].starts_with(ST) {
+            let s = i + 13;
+            let mut g = s;
+            while g < n && req[g] != b'>' {
+                g += 1;
+            }
+            if g < n {
+                let v = g + 1;
+                let mut e = v;
+                while e < n && req[e] != b'<' {
+                    e += 1;
+                }
+                if e < n {
+                    start = parse_u32_tag_value(&req[v..e]);
+                }
+            }
+            seen |= 1;
+            if seen == 3 {
+                break;
+            }
+            i = s;
+            continue;
+        }
+        if b == b'R' && seen & 2 == 0 && req[i..].starts_with(RC) {
+            let s = i + 14;
+            let mut g = s;
+            while g < n && req[g] != b'>' {
+                g += 1;
+            }
+            if g < n {
+                let v = g + 1;
+                let mut e = v;
+                while e < n && req[e] != b'<' {
+                    e += 1;
+                }
+                if e < n {
+                    count = parse_u32_tag_value(&req[v..e]);
+                }
+            }
+            seen |= 2;
+            if seen == 3 {
+                break;
+            }
+            i = s;
+            continue;
+        }
+        i += 1;
+    }
+    (start as usize, count)
+}
+
+fn parse_u32_tag_value(v: &[u8]) -> u32 {
+    if v.is_empty() || v.len() > 10 {
+        return 0;
+    }
+    let mut acc = 0u64;
+    for &d in v {
+        if !d.is_ascii_digit() {
+            return 0;
+        }
+        acc = acc * 10 + (d - b'0') as u64;
+    }
+    if acc <= u32::MAX as u64 {
+        acc as u32
+    } else {
+        0
+    }
+}
+
+// Allocation-free u32 rendering straight into a Vec (Xbox paged path only;
+// bytes identical to format!("{}", v)).
+fn push_u32_vec(out: &mut Vec<u8>, mut v: u32) {
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 10];
+    let mut n = 0usize;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+    }
+    while n > 0 {
+        n -= 1;
+        out.push(tmp[n]);
+    }
+}
+
+fn locate_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= hay.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + needle.len() <= hay.len() {
+        if hay[i] == needle[0] && &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// On-demand Xbox paginator over a precached FULL response (keeps the VLC
+// `Arc<[u8]>` cache untouched; only Xbox requests pay for this scan).
+// None = cached bytes already correct (send zero-copy). RequestedCount 0 =>
+// all remaining. Byte-identical to the Xbox BrowseEntry slicer: same prefix,
+// same contiguous item run, same patched NumberReturned/TotalMatches/Content-Length.
+fn paginate_cached(full: &[u8], start: usize, requested: u32) -> Option<Vec<u8>> {
+    const ITEM: &[u8] = b"&lt;item ";
+    const CONT: &[u8] = b"&lt;container ";
+    let n = full.len();
+    let he = locate_from(full, b"\r\n\r\n", 0).map(|p| p + 4).unwrap_or(n);
+    let first = locate_from(full, ITEM, he)
+        .into_iter()
+        .chain(locate_from(full, CONT, he))
+        .min();
+    let de = locate_from(full, b"&lt;/DIDL-Lite&gt;", he).unwrap_or(n);
+    let mut items: Vec<u32> = Vec::new();
+    if let Some(f) = first {
+        // Titles can't forge markers: '<' in titles is '&amp;lt;', never '&lt;'.
+        let mut k = f;
+        while k < de {
+            if full[k] == b'&' {
+                let r = &full[k..];
+                if r.starts_with(ITEM) || r.starts_with(CONT) {
+                    items.push(k as u32);
+                    k += 5; // skip "&lt;", never re-hit the same marker
+                    continue;
+                }
+            }
+            k += 1;
+        }
+    }
+    let total = items.len();
+    if total == 0 {
+        return None; // empty container already reports 0/0
+    }
+    if start == 0 && (requested == 0 || requested >= total as u32) {
+        return None; // full slice == cached bytes (counts already right)
+    }
+    let end = if requested == 0 {
+        total
+    } else {
+        total.min(start.saturating_add(requested as usize))
+    };
+    let s = start.min(total);
+    let returned = end.saturating_sub(s);
+    let (sel_s, sel_e) = if returned > 0 {
+        let a = items[s] as usize;
+        let z = if end < total { items[end] as usize } else { de };
+        (a, z)
+    } else {
+        (0, 0)
+    };
+    let nr_o = locate_from(full, b"<NumberReturned>", de).unwrap_or(n);
+    let nr_c = locate_from(full, b"</NumberReturned>", nr_o).unwrap_or(n);
+    let tm_o = locate_from(full, b"<TotalMatches>", nr_c).unwrap_or(n);
+    let tm_c = locate_from(full, b"</TotalMatches>", tm_o).unwrap_or(n);
+    let cl_o = locate_from(full, b"Content-Length: ", 0).unwrap_or(n);
+    let mut cl_e = cl_o + 16;
+    while cl_e < he && cl_e < n && full[cl_e].is_ascii_digit() {
+        cl_e += 1;
+    }
+    let (nr_vs, nr_ve, tm_vs, tm_ve, cl_vs, cl_ve) = (
+        (nr_o + 16).min(n),
+        nr_c.min(n),
+        (tm_o + 14).min(n),
+        tm_c.min(n),
+        cl_o.saturating_add(16).min(he),
+        cl_e.min(he),
+    );
+    let pe = first.unwrap_or(de);
+    let mut new_body: Vec<u8> =
+        Vec::with_capacity((pe - he) + (sel_e - sel_s) + (nr_vs - de) + 10 + (tm_vs - nr_ve) + 10 + (n - tm_ve));
+    new_body.extend_from_slice(&full[he..pe]);
+    if returned > 0 {
+        new_body.extend_from_slice(&full[sel_s..sel_e]);
+    }
+    new_body.extend_from_slice(&full[de..nr_vs]);
+    push_u32_vec(&mut new_body, returned as u32);
+    new_body.extend_from_slice(&full[nr_ve..tm_vs]);
+    push_u32_vec(&mut new_body, total as u32);
+    new_body.extend_from_slice(&full[tm_ve..]);
+    let mut new_resp = Vec::with_capacity(he + 16 + new_body.len());
+    new_resp.extend_from_slice(&full[..cl_vs]);
+    push_u32_vec(&mut new_resp, new_body.len() as u32);
+    new_resp.extend_from_slice(&full[cl_ve..he]);
+    new_resp.extend_from_slice(&new_body);
+    Some(new_resp)
+}
+
 // Pure byte-level POST handler
 async fn handle_post_request(
     mut stream: TcpStream,
@@ -428,6 +875,19 @@ async fn handle_post_request(
     cache: Arc<HashMap<Box<[u8]>, Arc<[u8]>>>,
     config: Arc<AppConfig>,
 ) {
+    // Xbox gate: headers-only slice decides the branch (body/ObjectID never
+    // influences detection, so a file named `xbox.mp4` can't trigger paging).
+    let hend = headers_end(req);
+    let headers = &req[..hend.min(req.len())];
+    let is_xbox = is_xbox_headers(headers);
+    // Only Xbox honors StartingIndex/RequestedCount (0 count = all remaining).
+    // Non-Xbox keeps the VLC contract: paging ignored downstream (full serve).
+    let (starting_index, requested_count) = if is_xbox {
+        extract_browse_paging(req)
+    } else {
+        (0usize, 0u32)
+    };
+
     let object_id = extract_object_id(req);
 
     if object_id.is_empty() {
@@ -450,7 +910,20 @@ async fn handle_post_request(
     } else {
         cache.get(lookup_id).or_else(|| cache.get(object_id))
     } {
-        let _ = timeout(WRITE_TIMEOUT, stream.write_all(cached_response)).await;
+        // Xbox paged path: slice the precached full response on demand.
+        // Non-Xbox: verbatim full serve (byte-identical to before).
+        if is_xbox {
+            match paginate_cached(cached_response, starting_index, requested_count) {
+                None => {
+                    let _ = timeout(WRITE_TIMEOUT, stream.write_all(cached_response)).await;
+                }
+                Some(paged) => {
+                    let _ = timeout(WRITE_TIMEOUT, stream.write_all(&paged)).await;
+                }
+            }
+        } else {
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(cached_response)).await;
+        }
         return;
     }
 
@@ -478,7 +951,14 @@ async fn handle_post_request(
     combined_path.push_str(&safe);
     if let Ok(metadata) = fs::metadata(&combined_path).await {
         if metadata.is_dir() {
-            let browse_response = generate_browse_response(decoded_ref, 0, 5000, &config.local_ip, &config.dir_path).await;
+            // Xbox renders directly paged (TotalMatches=total, NumberReturned=
+            // sliced); all others render full (0, 5000) exactly as before.
+            let (si, rc) = if is_xbox {
+                (starting_index as u32, requested_count)
+            } else {
+                (0u32, 5000u32)
+            };
+            let browse_response = generate_browse_response(decoded_ref, si, rc, &config.local_ip, &config.dir_path).await;
             let _ = timeout(WRITE_TIMEOUT, stream.write_all(browse_response.as_bytes())).await;
         }
     }
@@ -540,8 +1020,13 @@ async fn generate_browse_response_inner(path: &str, starting_index: u32, request
     // container ids (display_path itself can hold & < > " ' from dir names).
     let enc_path = encode(&display_path);
     let esc_path = escape_didl(&display_path);
+    // UPnP paging: RequestedCount 0 means "all remaining" (Xbox sends 12 for
+    // pages, 0 for "everything"). TotalMatches is always the full child
+    // count; NumberReturned is the sliced count. Non-Xbox callers always pass
+    // (0, 5000), so this is byte-identical for them on dirs < 5000 children.
+    let total_children = dirs.len() + files.len();
     for name in dirs.iter().chain(files.iter()) {
-        if loop_count >= starting_index + requested_count { break; }
+        if requested_count != 0 && loop_count >= starting_index.saturating_add(requested_count) { break; }
         if loop_count < starting_index {
             loop_count += 1; continue;
         }
@@ -579,7 +1064,7 @@ async fn generate_browse_response_inner(path: &str, starting_index: u32, request
         count += 1;
     }
 
-    soap.push_str(&format!("&lt;/DIDL-Lite&gt;</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>0</UpdateID></u:BrowseResponse></s:Body></s:Envelope>", count, count));
+    soap.push_str(&format!("&lt;/DIDL-Lite&gt;</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>0</UpdateID></u:BrowseResponse></s:Body></s:Envelope>", count, total_children));
 
     let resp = format!("HTTP/1.1 200 OK\r\nConnection: Keep-Alive\r\nContent-Type: text/xml;\r\nContent-Length: {}\r\nServer: RustyDLNA DLNADOC/1.50 UPnP/1.0 RustyDLNA7/1.3.0\r\n\r\n{}", soap.len(), soap);
     (resp, dirs)
@@ -899,9 +1384,10 @@ const ROOT_DESC_XML: &str = r#"<?xml version="1.0"?><root xmlns="urn:schemas-upn
 #[cfg(test)]
 mod perf_benches {
     use super::{
-        contains_sortcaps, decode, encode, escape_didl, extract_object_id,
-        generate_browse_response, headers_complete, parse_range_header, push_u64,
-        put_slice, sanitize_path,
+        contains_sortcaps, decode, encode, escape_didl, extract_browse_paging,
+        extract_object_id, generate_browse_response, headers_complete, is_xbox_headers,
+        paginate_cached, parse_content_length, parse_range_header, push_u64, put_slice,
+        sanitize_path,
     };
     use std::hint::black_box;
     use std::time::Instant;
@@ -1456,6 +1942,109 @@ mod perf_benches {
             req.extend_from_slice(body);
             assert_eq!(extract_object_id(&req), expected.as_bytes(), "oid {:?}", body);
         }
+    }
+
+    #[test]
+    fn correctness_xbox_detect() {
+        // Header-scoped only: UA line value must match the Xbox/Windows DLNA
+        // stack (any case). The Xbox Media Player app sends the Windows stack
+        // UA with no "xbox" in it (observed live).
+        for (headers, expected) in [
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: Xbox/2.0\r\n\r\n", true),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: Xbox-One/2.0\r\n\r\n", true),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: XBOX\r\n\r\n", true),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nuser-agent: xbox\r\n\r\n", true),
+            (
+                "GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: Microsoft-Windows/10.0 UPnP/1.0 Microsoft-DLNA DLNADOC/1.50\r\n\r\n",
+                true,
+            ),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: MICROSOFT-DLNA/1.0\r\n\r\n", true),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: VLC/3.0.20 LibVLC/3.0.20\r\n\r\n", false),
+            (
+                "GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: Linux/5.0 UPnP/1.0 DLNADOC/1.50 Samsung-TV/1.0\r\n\r\n",
+                false,
+            ),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: curl/8.0\r\n\r\n", false),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: PLAYSTATION 3; DLNADOC/1.50\r\n\r\n", false),
+            ("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", false),
+            ("GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: \r\n\r\n", false),
+            // Body must never trigger detection (headers-only contract).
+            ("POST /c HTTP/1.1\r\nHost: x\r\n\r\n<ObjectID>xbox</ObjectID>", false),
+            ("POST /c HTTP/1.1\r\nHost: x\r\nUser-Agent: VLC\r\n\r\n<ObjectID>xbox</ObjectID>", false),
+            ("POST /c HTTP/1.1\r\nHost: x\r\nUser-Agent: VLC\r\n\r\n<ObjectID>Microsoft-DLNA</ObjectID>", false),
+        ] {
+            assert_eq!(is_xbox_headers(headers.as_bytes()), expected, "xbox {:?}", headers);
+        }
+        // Content-Length helper used by the Xbox-gated body wait.
+        assert_eq!(parse_content_length(b"Content-Length: 1234\r\n\r\n"), 1234);
+        assert_eq!(parse_content_length(b"content-length: 7\r\n\r\n"), 7);
+        assert_eq!(parse_content_length(b"Host: x\r\n\r\n"), 0);
+    }
+
+    #[test]
+    fn correctness_browse_paging() {
+        let mk = |si: &str, rc: &str| {
+            format!("<ObjectID>0</ObjectID><StartingIndex>{}</StartingIndex><RequestedCount>{}</RequestedCount>", si, rc).into_bytes()
+        };
+        assert_eq!(extract_browse_paging(&mk("12", "12")), (12, 12));
+        assert_eq!(extract_browse_paging(&mk("0", "0")), (0, 0));
+        assert_eq!(extract_browse_paging(&mk("", "10")), (0, 10));
+        assert_eq!(extract_browse_paging(&mk("5", "")), (5, 0));
+        assert_eq!(extract_browse_paging(b"<ObjectID>0</ObjectID>".as_slice()), (0, 0));
+        // Xbox attrs `<StartingIndex ...>12</...>` via first-'>' skip.
+        assert_eq!(
+            extract_browse_paging(b"<StartingIndex xmlns:dt=\"x\" dt:dt=\"ui4\">7</StartingIndex><RequestedCount>3</RequestedCount>".as_slice()),
+            (7, 3)
+        );
+        // Overflow / non-digit / >10-digit => 0.
+        assert_eq!(extract_browse_paging(&mk("99999999999", "12")), (0, 12));
+        assert_eq!(extract_browse_paging(&mk("abc", "12")), (0, 12));
+    }
+
+    #[tokio::test]
+    async fn correctness_paginate_cached() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustydlna_page_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..5u32 {
+            std::fs::write(dir.join(format!("f{:02}.mp4", i)), b"data").unwrap();
+        }
+        let d = dir.to_str().unwrap();
+        let full = generate_browse_response("", 0, 5000, "127.0.0.1", d).await;
+        assert!(full.contains("<NumberReturned>5</NumberReturned>"));
+        assert!(full.contains("<TotalMatches>5</TotalMatches>"));
+        // Full fast path: None (send zero-copy).
+        assert!(paginate_cached(full.as_bytes(), 0, 0).is_none());
+        assert!(paginate_cached(full.as_bytes(), 0, 5).is_none());
+        assert!(paginate_cached(full.as_bytes(), 0, 5000).is_none());
+        // Paged slice: NumberReturned=slice, TotalMatches=full, CL correct.
+        let p = paginate_cached(full.as_bytes(), 1, 2).expect("page 1,2");
+        let s = String::from_utf8_lossy(&p);
+        assert!(s.contains("<NumberReturned>2</NumberReturned>"), "page count:\n{}", s);
+        assert!(s.contains("<TotalMatches>5</TotalMatches>"), "page total:\n{}", s);
+        assert!(s.contains("f01.mp4") && s.contains("f02.mp4"), "page items:\n{}", s);
+        assert!(!s.contains("f00.mp4") && !s.contains("f04.mp4"), "page excludes:\n{}", s);
+        let (h, b) = p.split_at(p.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4);
+        let cl: usize = String::from_utf8_lossy(h)
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .unwrap()[16..]
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(cl, b.len(), "paged Content-Length");
+        // Tail + beyond-end.
+        let t = paginate_cached(full.as_bytes(), 4, 10).expect("tail");
+        assert!(String::from_utf8_lossy(&t).contains("<NumberReturned>1</NumberReturned>"));
+        let e = paginate_cached(full.as_bytes(), 9, 10).expect("past end");
+        assert!(String::from_utf8_lossy(&e).contains("<NumberReturned>0</NumberReturned>"));
+        assert!(String::from_utf8_lossy(&e).contains("<TotalMatches>5</TotalMatches>"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
