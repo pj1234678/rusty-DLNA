@@ -490,9 +490,13 @@ fn source_static_routes_and_helpers_locked() {
     assert!(src.contains("fn headers_complete"), "terminator scan changed");
     // Incremental scan must keep the loop invariant documented in main.rs.
     assert!(src.contains("saturating_sub(3)"), "incremental header scan changed");
-    // No UA sniffing: exact functionality serves every client identically.
-    assert!(!src.contains("User-Agent"), "server must stay User-Agent-blind");
-    assert!(!src.contains("user_agent"), "server must stay User-Agent-blind");
+    // UA-gated Xbox paging: only a `User-Agent:` header line containing
+    // `xbox` (any case) takes the paged path. Everything else keeps the VLC
+    // contract (ignore paging, header-only POST dispatch). Header-scoped only
+    // (body/ObjectID never triggers it).
+    assert!(src.contains("User-Agent"), "Xbox UA gate missing");
+    assert!(src.contains("is_xbox_headers"), "Xbox UA gate missing");
+    assert!(src.contains("contains_xbox_ci"), "Xbox UA gate missing");
     // decode() must handle double-encoded "&amp;amp;" BEFORE single "&amp;",
     // otherwise "a&amp;amp;b" would decode wrong.
     {
@@ -500,14 +504,18 @@ fn source_static_routes_and_helpers_locked() {
         let i_single = src.find("(\"&amp;\", \"&\")").expect("single-amp entity handling");
         assert!(i_double < i_single, "decode order: double-amp first");
     }
-    // Both precache and fallback generate with (0, 5000): pagination params
-    // from the wire are always ignored. (Scoped to production code: the
-    // in-tree benches use 0, 5000 too.)
-    assert_eq!(
-        src.split("mod perf_benches").next().unwrap().matches(", 0, 5000,").count(),
-        2,
-        "both generate_browse_response call sites must use 0, 5000"
-    );
+    // Precache still generates with (0, 5000) (full snapshot); the dynamic
+    // fallback renders (0, 5000) for non-Xbox and (start, count) for Xbox.
+    // (Scoped to production code: the in-tree benches use 0, 5000 too.)
+    {
+        let prod = src.split("mod perf_benches").next().unwrap();
+        assert!(
+            prod.matches(", 0, 5000,").count() >= 1,
+            "precache must still generate full (0, 5000)"
+        );
+        assert!(prod.contains("is_xbox"), "fallback must branch on Xbox UA");
+        assert!(prod.contains("paginate_cached"), "Xbox paged slice missing");
+    }
 }
 
 #[test]
@@ -1069,10 +1077,58 @@ async fn exact_dlna_functionality() {
         assert!(b.contains("http://127.0.0.1:8200/movies/action/deep.mp4"));
         assert!(b.contains("<NumberReturned>1</NumberReturned>"));
     }
-    // StartingIndex is IGNORED (pre-cached full response)
+    // StartingIndex is IGNORED for non-Xbox (pre-cached full response)
     {
         let r1 = send_raw(TEST_IP, &browse_post("0", 1)).await;
-        assert_eq!(r1, root_resp, "StartingIndex must be ignored (cache)");
+        assert_eq!(r1, root_resp, "StartingIndex must be ignored without Xbox UA (cache)");
+    }
+    // Xbox UA honors StartingIndex/RequestedCount (paged slice).
+    {
+        let body = format!(
+            "{}{}{}{}{}{}",
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>"#,
+            r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">"#,
+            "<ObjectID>0</ObjectID>",
+            "<BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter>",
+            "<StartingIndex>1</StartingIndex><RequestedCount>2</RequestedCount>",
+            "<SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>",
+        );
+        let req = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nUser-Agent: Xbox/2.0\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+            TEST_IP,
+            body.len(),
+            body
+        );
+        let r = send_raw(TEST_IP, req.as_bytes()).await;
+        assert!(!r.is_empty(), "Xbox paged browse must answer");
+        assert_ne!(r, root_resp, "Xbox paged browse must differ from full");
+        let b = body_str(&r);
+        assert!(b.contains("<NumberReturned>2</NumberReturned>"), "Xbox page count:\n{}", b);
+        assert!(b.contains("<TotalMatches>14</TotalMatches>"), "Xbox page total:\n{}", b);
+        let (hdr, bdy) = split_response(&r);
+        assert_eq!(parse_content_length(&hdr), Some(bdy.len()), "Xbox paged CL");
+        // Same paging WITHOUT Xbox UA must still return full (VLC contract).
+        let req_plain = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+            TEST_IP,
+            body.len(),
+            body
+        );
+        assert_eq!(
+            send_raw(TEST_IP, req_plain.as_bytes()).await,
+            root_resp,
+            "paging without Xbox UA must be ignored"
+        );
+        // The real Xbox Media Player app sends the Windows DLNA stack UA
+        // (no "xbox" in it, observed live) — it must page identically.
+        let req_ms = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nUser-Agent: Microsoft-Windows/10.0 UPnP/1.0 Microsoft-DLNA DLNADOC/1.50\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+            TEST_IP,
+            body.len(),
+            body
+        );
+        let r_ms = send_raw(TEST_IP, req_ms.as_bytes()).await;
+        assert_eq!(r_ms, r, "Microsoft-DLNA UA must page like Xbox");
     }
     // unknown dir / file id / bad post => NO reply (empty)
     for oid in ["nosuchdir/", "root.mp4", "movies/nonexistent/"] {
@@ -1222,12 +1278,35 @@ async fn exact_dlna_functionality() {
         );
         assert_ne!(r, movies_resp, "movies without slash must differ from movies/");
     }
-    // RequestedCount AND StartingIndex are both ignored (pre-cached).
+    // RequestedCount AND StartingIndex are both ignored without Xbox UA.
     {
         let r_rc1 = send_raw(TEST_IP, &browse_post_custom("0", 0, 1)).await;
-        assert_eq!(r_rc1, root_resp, "RequestedCount must be ignored");
+        assert_eq!(r_rc1, root_resp, "RequestedCount must be ignored without Xbox UA");
         let r_si5 = send_raw(TEST_IP, &browse_post_custom("0", 5, 10)).await;
-        assert_eq!(r_si5, root_resp, "StartingIndex 5 must be ignored");
+        assert_eq!(r_si5, root_resp, "StartingIndex 5 must be ignored without Xbox UA");
+    }
+    // RequestedCount 0 with Xbox UA means "all remaining" (full fast path).
+    {
+        let body = format!(
+            "{}{}{}{}{}{}",
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>"#,
+            r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">"#,
+            "<ObjectID>0</ObjectID>",
+            "<BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter>",
+            "<StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount>",
+            "<SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>",
+        );
+        let req = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nUser-Agent: XBOX\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+            TEST_IP,
+            body.len(),
+            body
+        );
+        assert_eq!(
+            send_raw(TEST_IP, req.as_bytes()).await,
+            root_resp,
+            "Xbox count 0 must return full"
+        );
     }
     // ObjectID beats GetSortCapabilities when both present.
     {
@@ -1299,8 +1378,9 @@ async fn exact_dlna_functionality() {
         let r2 = send_raw(TEST_IP, &get_req("/root.mp4", None)).await;
         assert_eq!(split_response(&r2).1, root_mp4, "server must survive oversize");
     }
-    // Split-packet POST (headers now, body later) gets NO reply: the server
-    // never waits for the body past \r\n\r\n.
+    // Split-packet POST (headers now, body later) gets NO reply without Xbox
+    // UA: the server never waits for the body past \r\n\r\n. With Xbox UA the
+    // server waits up to Content-Length (split-packet Browse fix).
     {
         let body = b"<s:Envelope><s:Body><ObjectID>0</ObjectID></s:Body></s:Envelope>".to_vec();
         let headers = format!(
@@ -1310,7 +1390,54 @@ async fn exact_dlna_functionality() {
         )
         .into_bytes();
         let r = send_split_post(TEST_IP, &headers, &body).await;
-        assert!(r.is_empty(), "split POST must be silent, got {}b", r.len());
+        assert!(r.is_empty(), "split POST must be silent without Xbox UA, got {}b", r.len());
+    }
+    // Split-packet POST WITH Xbox UA is answered once the body arrives.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = b"<s:Envelope><s:Body><ObjectID>0</ObjectID></s:Body></s:Envelope>".to_vec();
+        let headers = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nUser-Agent: Xbox/2.0\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
+            TEST_IP,
+            body.len()
+        )
+        .into_bytes();
+        let mut stream = tokio::net::TcpStream::connect(format!("{}:{}", TEST_IP, TCP_PORT))
+            .await
+            .expect("connect for Xbox split post");
+        stream.write_all(&headers).await.expect("write Xbox headers");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = stream.write_all(&body).await;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 32768];
+        let _ = timeout(Duration::from_secs(4), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        out.extend_from_slice(&buf[..n]);
+                        if let Some(p) = find_double_crlf(&out) {
+                            if let Some(cl) = parse_content_length(&out[..p]) {
+                                if out.len() >= p + 4 + cl {
+                                    break;
+                                }
+                            }
+                        }
+                        if out.len() > 10_000_000 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        assert!(!out.is_empty(), "Xbox split POST must be answered");
+        assert!(
+            body_str(&out).contains("<NumberReturned>"),
+            "Xbox split POST must browse, got {}b",
+            out.len()
+        );
     }
     // Traversal can never escape: sibling file outside media stays hidden.
     {
@@ -1730,14 +1857,16 @@ async fn exact_dlna_functionality() {
     }
 
     // ---- user-agent / ignored headers (same server) --------------------------
-    // The server never sniffs User-Agent (no such code): DLNA TVs, consoles,
-    // VLC, curl, empty and 2 KiB UAs must all be byte-identical to baseline.
+    // GET file/static routes ignore User-Agent entirely (all UAs byte-identical,
+    // incl. Xbox and 2 KiB). POST browse ignores UA except Xbox paging: only a
+    // `User-Agent:` line containing `xbox` honors StartingIndex/RequestedCount.
     {
         let baseline_get = send_raw(TEST_IP, &get_req("/root.mp4", None)).await;
         for ua in [
             "VLC/3.0.20 LibVLC/3.0.20",
             "Linux/5.0 UPnP/1.0 DLNADOC/1.50 Samsung-TV/1.0",
             "Xbox-One/2.0",
+            "XBOX",
             "curl/8.0",
             "PLAYSTATION 3; DLNADOC/1.50",
         ] {
@@ -1748,7 +1877,7 @@ async fn exact_dlna_functionality() {
             assert_eq!(
                 send_raw(TEST_IP, req.as_bytes()).await,
                 baseline_get,
-                "User-Agent {} must be ignored",
+                "GET User-Agent {} must be ignored",
                 ua
             );
         }
@@ -1761,11 +1890,12 @@ async fn exact_dlna_functionality() {
             );
             assert_eq!(send_raw(TEST_IP, req.as_bytes()).await, baseline_get, "2KiB UA ignored");
         }
-        // Static route + POST browse are equally UA-blind.
+        // Static route ignores UA.
         {
             let baseline_static = send_raw(TEST_IP, &get_req("/rootDesc.xml", None)).await;
             let req = format!("GET /rootDesc.xml HTTP/1.1\r\nHost: {}\r\nUser-Agent: Samsung-TV\r\n\r\n", TEST_IP);
             assert_eq!(send_raw(TEST_IP, req.as_bytes()).await, baseline_static, "static+UA identical");
+            // Non-Xbox POST browse ignores UA (VLC contract).
             let body = "<s:Envelope><s:Body><ObjectID>0</ObjectID></s:Body></s:Envelope>";
             let with_ua = format!(
                 "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nUser-Agent: VLC/3.0\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
@@ -1782,7 +1912,19 @@ async fn exact_dlna_functionality() {
             assert_eq!(
                 send_raw(TEST_IP, with_ua.as_bytes()).await,
                 send_raw(TEST_IP, without_ua.as_bytes()).await,
-                "POST+UA identical"
+                "non-Xbox POST+UA identical"
+            );
+            // Xbox UA without paging params still returns full (fast path).
+            let with_xbox = format!(
+                "POST /ctl/ContentDir HTTP/1.1\r\nHost: {}\r\nUser-Agent: Xbox/2.0\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+                TEST_IP,
+                body.len(),
+                body
+            );
+            assert_eq!(
+                send_raw(TEST_IP, with_xbox.as_bytes()).await,
+                send_raw(TEST_IP, without_ua.as_bytes()).await,
+                "Xbox without paging must equal full"
             );
         }
     }
@@ -1797,7 +1939,8 @@ async fn exact_dlna_functionality() {
         let lower = format!("GET /root.mp4 HTTP/1.1\r\nhost: {}\r\n\r\n", TEST_IP).into_bytes();
         assert_eq!(send_raw(TEST_IP, &lower).await, baseline, "lowercase host ignored");
     }
-    // POST ignores Content-Type and Content-Length (reads only to \\r\\n\\r\\n).
+    // Non-Xbox POST ignores Content-Type and Content-Length (reads only to
+    // \r\n\r\n; Xbox UA alone may wait for the body, covered above).
     {
         let body = "<s:Envelope><s:Body><ObjectID>0</ObjectID></s:Body></s:Envelope>";
         let baseline = send_raw(
